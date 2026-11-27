@@ -8,8 +8,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Document, Page
+from app.db.models import Chunk, Document, Page
 from app.models.schemas import DocumentList, DocumentOut, DocumentSummary, PageOut
+from app.services.chunker import chunk_pages
 from app.services.ocr import ocr_file
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ MAX_BYTES = 20 * 1024 * 1024  # حداکثر ۲۰ مگابایت
 
 
 @router.post("", response_model=DocumentOut)
-def create_document(file: UploadFile = File(...)):
+def create_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
     # ۱) بررسی نوع فایل
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
@@ -35,7 +36,7 @@ def create_document(file: UploadFile = File(...)):
     if len(content) > MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 20 MB)")
 
-    # ۳) ذخیره با اسم امن و یکتا
+    # ۳) ذخیره فایل با اسم امن و یکتا
     document_id = uuid.uuid4().hex
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     saved_path = UPLOAD_DIR / f"{document_id}{suffix}"
@@ -48,13 +49,38 @@ def create_document(file: UploadFile = File(...)):
         logger.exception("OCR failed for %s", saved_path)
         raise HTTPException(status_code=500, detail="OCR processing failed")
 
-    # ۵) ساخت پاسخ
+    # ۵) chunk کردن و ذخیره توی دیتابیس
+    filename = file.filename or saved_path.name
+    text_chunks = chunk_pages([(p.page_no, p.text) for p in pages])
+    document = Document(
+        id=document_id,
+        filename=filename,
+        stored_path=saved_path.name,
+        num_pages=len(pages),
+        status="done",
+        pages=[Page(page_no=p.page_no, text=p.text) for p in pages],
+        chunks=[
+            Chunk(page_no=c.page_no, chunk_index=c.chunk_index, text=c.text)
+            for c in text_chunks
+        ],
+    )
+    try:
+        db.add(document)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("DB save failed for %s", document_id)
+        raise HTTPException(status_code=500, detail="Failed to save document")
+
+    # ۶) ساخت پاسخ
     return DocumentOut(
         document_id=document_id,
-        filename=file.filename or saved_path.name,
+        filename=filename,
         num_pages=len(pages),
         pages=[PageOut(page_no=p.page_no, text=p.text) for p in pages],
     )
+
+
 @router.get("", response_model=DocumentList)
 def list_documents(
     limit: int = Query(20, ge=1, le=100),
