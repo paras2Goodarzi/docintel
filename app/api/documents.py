@@ -2,9 +2,14 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
-from app.models.schemas import DocumentOut, PageOut
+from app.db.database import get_db
+from app.db.models import Document, Page
+from app.models.schemas import DocumentList, DocumentOut, DocumentSummary, PageOut
 from app.services.ocr import ocr_file
 
 logger = logging.getLogger(__name__)
@@ -49,4 +54,40 @@ def create_document(file: UploadFile = File(...)):
         filename=file.filename or saved_path.name,
         num_pages=len(pages),
         pages=[PageOut(page_no=p.page_no, text=p.text) for p in pages],
+    )
+@router.get("", response_model=DocumentList)
+def list_documents(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    total = db.scalar(select(func.count()).select_from(Document)) or 0
+    rows = db.scalars(
+        select(Document).order_by(Document.created_at.desc()).limit(limit).offset(offset)
+    ).all()
+    return DocumentList(
+        total=total,
+        items=[
+            DocumentSummary(
+                document_id=d.id,
+                filename=d.filename,
+                num_pages=d.num_pages,
+                status=d.status,
+                created_at=d.created_at,
+            )
+            for d in rows
+        ],
+    )
+
+
+@router.get("/{document_id}", response_model=DocumentOut)
+def get_document(document_id: str, db: Session = Depends(get_db)):
+    doc = db.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return DocumentOut(
+        document_id=doc.id,
+        filename=doc.filename,
+        num_pages=doc.num_pages,
+        pages=[PageOut(page_no=p.page_no, text=p.text) for p in doc.pages],
     )
