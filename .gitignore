@@ -9,3 +9,4 @@ data/processed/*
 .idea/
 .vscode/
 .tessdata/
+*.db
